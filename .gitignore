@@ -1,0 +1,7 @@
+notes.txt
+.DS_Store
+venv/
+logs/
+__pycache__/
+*.pyc
+.env
