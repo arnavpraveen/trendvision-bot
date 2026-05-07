@@ -107,6 +107,20 @@ SHORT_STOP_LOSS_PCT = 20.0   # SHORT: synthetic stop trigger at entry × (1 + SL
 # pre-market spreads and fast moves; too tight and a runaway stock won't fill.
 SHORT_STOP_LIMIT_BUFFER_PCT = 5.0
 
+# Time-window stop rule (SHORT only): only enforce the synthetic stop if the
+# trigger is breached within this many minutes of entry.  After the window
+# expires, the position is held to EOD regardless of price action.
+#
+# Rationale: empirically (Apr 21–24 inspector analysis, n=24 stops) the
+# synthetic stop earned its keep on fast-gap squeezes (trigger crossed within
+# minutes of entry — the EFOI/SCNI/NTIP class) but bled money on slow grinds
+# that crossed trigger after 30+ minutes and then mean-reverted by EOD.
+# A 20-min window simulated +$180 improvement on that sample, with a 9-of-11
+# hit rate on decisive cases.  See trade_inspector.py --what-if-stop-window-min.
+#
+# Set to None to disable (current bot behavior — stop active for full hold).
+SHORT_STOP_WINDOW_MIN = 20.0   # minutes; None disables the time-window rule
+
 # End-of-day forced close – single market sell submitted at this time (ET).
 # tif='DAY' so unfilled sells auto-cancel at market close.
 # Reconciliation picks up any survivors the next trading day.
@@ -442,6 +456,7 @@ def save_positions_state():
                 'sl_order_id'  : pos.get('sl_order_id'),
                 'stop_price'   : pos.get('stop_price'),
                 'stop_triggered': pos.get('stop_triggered', False),
+                'stop_window_expired': pos.get('stop_window_expired', False),
             }
         with open(POSITIONS_STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
@@ -510,6 +525,7 @@ def load_positions_state():
                             'eod_sell_order_id': pos_data.get('eod_sell_order_id'),
                             'stop_price'      : pos_data.get('stop_price'),
                             'stop_triggered'  : pos_data.get('stop_triggered', False),
+                            'stop_window_expired': pos_data.get('stop_window_expired', False),
                             'direction'       : TRADE_DIRECTION,
                         }
                         logger.info(f"  ✅ {ticker}: {pos_data['shares']} shares @ {fmt(pos_data['entry_price'])}")
@@ -816,6 +832,16 @@ def check_synthetic_stops():
       execute outside RTH, so we poll price ourselves and submit a limit
       cover the instant the trigger is crossed.
 
+    Time-window rule (SHORT_STOP_WINDOW_MIN):
+      The stop is only enforced during the first SHORT_STOP_WINDOW_MIN
+      minutes after entry.  After that, stop_window_expired flips True and
+      the position rides to EOD regardless of price.  This is empirically
+      derived: fast-gap squeezes (the EFOI/SCNI/NTIP class) trigger within
+      seconds-to-minutes of entry, but stops that fire 30+ min after entry
+      tend to be slow grinds that mean-revert by EOD — holding through is
+      better.  Set SHORT_STOP_WINDOW_MIN=None to disable and revert to the
+      previous always-on behavior.
+
     Design:
       - Uses ib.portfolio() marketPrice for trigger detection.  No per-ticker
         snapshot calls; portfolio data updates continuously via ib_insync.
@@ -833,12 +859,38 @@ def check_synthetic_stops():
     if TRADE_DIRECTION != 'SHORT':
         return
 
+    now = get_et()
+
     with positions_lock:
+        # Phase 1: identify positions whose stop window has expired and mark
+        # them so the next sweep skips them entirely.  We log once per
+        # position (gated by stop_window_expired) so the audit trail is clean.
+        if SHORT_STOP_WINDOW_MIN is not None:
+            for ticker, p in active_positions.items():
+                if (p.get('direction') != 'SHORT'
+                        or p.get('stop_price') is None
+                        or p.get('stop_triggered')
+                        or p.get('stop_window_expired')):
+                    continue
+                entry_time = p.get('entry_time')
+                if entry_time is None:
+                    continue
+                age_min = (now - entry_time).total_seconds() / 60
+                if age_min > SHORT_STOP_WINDOW_MIN:
+                    p['stop_window_expired'] = True
+                    logger.info(
+                        f"   ⏰ {ticker}: synthetic stop window expired "
+                        f"({age_min:.1f}min > {SHORT_STOP_WINDOW_MIN:g}min) "
+                        f"— holding to EOD"
+                    )
+
+        # Phase 2: collect candidates that are still inside the window.
         candidates = [
             (t, p) for t, p in active_positions.items()
             if p.get('direction') == 'SHORT'
                and p.get('stop_price') is not None
                and not p.get('stop_triggered')
+               and not p.get('stop_window_expired')
         ]
 
     if not candidates:
@@ -1379,9 +1431,13 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                 # so we monitor price ourselves and fire a limit cover the instant
                 # the trigger is crossed.
                 stop_price = round(fill_price * (1 + SHORT_STOP_LOSS_PCT / 100), 4)
+                _window_str = (
+                    f", active for {SHORT_STOP_WINDOW_MIN:g}min from entry"
+                    if SHORT_STOP_WINDOW_MIN is not None else ""
+                )
                 logger.info(
                     f"   🛡️  Synthetic SL armed: cover when market ≥ {fmt(stop_price)}  "
-                    f"(+{SHORT_STOP_LOSS_PCT}%)"
+                    f"(+{SHORT_STOP_LOSS_PCT}%{_window_str})"
                 )
                 # sl_order_id stays None until check_synthetic_stops() fires.
 
@@ -1449,6 +1505,11 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                     # and writes sl_order_id on fire.
                     'stop_price'    : stop_price,
                     'stop_triggered': False,
+                    # Time-window rule: set to True by check_synthetic_stops()
+                    # once `now - entry_time > SHORT_STOP_WINDOW_MIN`.  Once
+                    # set, the synthetic stop stops monitoring this position
+                    # and EOD close handles it.
+                    'stop_window_expired': False,
                     'direction'   : TRADE_DIRECTION,
                 }
                 save_positions_state()
@@ -1542,13 +1603,17 @@ def log_detailed_trade(ticker, action, shares,
         'hold_time_sec'     : int(hold_time_sec)        if hold_time_sec  is not None else '',
         'hold_time_min'     : int(hold_time_sec / 60)   if hold_time_sec  is not None else '',
         # Reflect the actual stop configuration in effect for this trade.
-        # SHORT mode: synthetic BUY-limit stop at +SHORT_STOP_LOSS_PCT%.
+        # SHORT mode: synthetic BUY-limit stop at +SHORT_STOP_LOSS_PCT%, with
+        # an optional time-window gate (SHORT_STOP_WINDOW_MIN).
         # LONG mode:  OCA bracket with TP/SL pair.
         # Previously this was hardcoded to 'EOD_ONLY' which was wrong for
         # every trade since the 20% stop was added.
-        'stop_percent'      : (f'SL:{SHORT_STOP_LOSS_PCT:g}%'
-                               if TRADE_DIRECTION == 'SHORT'
-                               else f'TP:{TAKE_PROFIT_PCT:g}%/SL:{STOP_LOSS_PCT:g}%'),
+        'stop_percent'      : (
+            (f'SL:{SHORT_STOP_LOSS_PCT:g}%'
+             + (f'@≤{SHORT_STOP_WINDOW_MIN:g}min' if SHORT_STOP_WINDOW_MIN is not None else ''))
+            if TRADE_DIRECTION == 'SHORT'
+            else f'TP:{TAKE_PROFIT_PCT:g}%/SL:{STOP_LOSS_PCT:g}%'
+        ),
         'order_id'          : order_id      or '',
         'stop_order_id'     : stop_order_id or '',
         'pct_change'        : pct_change,
