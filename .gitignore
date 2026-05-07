@@ -6,4 +6,5 @@ __pycache__/
 *.pyc
 .env
 *.csv
+!detailed_trades.csv
 inspector_reports/
