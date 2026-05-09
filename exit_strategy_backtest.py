@@ -599,14 +599,86 @@ def simulate_exit(
     )
 
 
+def anchor_bars_to_recorded_entry(
+    bars: pd.DataFrame,
+    entry_time_str: str,
+    recorded_entry_price: float,
+    warn_threshold: float = 1.5,
+) -> tuple[pd.DataFrame, float]:
+    """Rescale OHLC bars so the bar covering entry_time matches the bot's
+    recorded entry_price.
+
+    Why this is needed:
+      IBKR's historical bar API returns SPLIT-ADJUSTED prices.  Small-cap
+      pump-and-dump tickers frequently do reverse splits (1-for-50, etc.)
+      between the trade date and the fetch date.  When that happens, the
+      raw bars come back at the post-split scale (e.g. $25) while the
+      bot's recorded entry was at the pre-split scale (e.g. $0.50).
+      Without rescaling, the simulator sees prices ~50x what the bot saw,
+      which produces fake catastrophic losses on hold-to-EOD strategies
+      and fake bonanzas on long strategies.
+
+    Method:
+      Find the bar covering entry_time.  Compute ratio = recorded_entry_price
+      / that bar's open.  Multiply all OHLC by ratio.  The first bar now
+      shows the price at the recorded scale; all subsequent bars are scaled
+      proportionally, so % moves are preserved.
+
+    Returns (scaled_bars, ratio).  ratio == 1.0 means no adjustment was
+    needed (or possible).  If |ratio - 1| > warn_threshold the caller
+    can decide to drop the trade (likely a split).
+    """
+    if bars is None or bars.empty or recorded_entry_price <= 0:
+        return bars, 1.0
+
+    entry_time = pd.Timestamp(entry_time_str)
+    if bars.index.tz is not None and entry_time.tz is None:
+        entry_time = entry_time.tz_localize(bars.index.tz)
+
+    # Find the first bar at or after entry_time
+    future = bars[bars.index >= entry_time]
+    if future.empty:
+        return bars, 1.0
+
+    bar_price = float(future.iloc[0]["open"])
+    if bar_price <= 0:
+        return bars, 1.0
+
+    ratio = recorded_entry_price / bar_price
+    # Tiny adjustments (<1%) are noise from price-tick alignment; skip them.
+    if abs(ratio - 1.0) < 0.01:
+        return bars, 1.0
+
+    scaled = bars.copy()
+    for col in ("open", "high", "low", "close"):
+        scaled[col] = scaled[col] * ratio
+
+    return scaled, ratio
+
+
 def run_backtest(
     trades: list[dict],
     bars_map: dict[tuple[str, str], pd.DataFrame],
     strategies: list[ExitStrategy],
+    drop_threshold: float = 1.5,
 ) -> dict[str, list[TradeResult]]:
-    """Run all strategies across all trades. Returns {strategy_name: [TradeResult]}."""
+    """Run all strategies across all trades. Returns {strategy_name: [TradeResult]}.
+
+    drop_threshold: if the entry-price-anchor ratio diverges from 1 by more
+    than this multiplicative factor (default 1.5x in either direction —
+    so ratio < 0.4 or ratio > 2.5), the trade is skipped entirely.  Such
+    extreme ratios indicate a corporate action (split, ticker change) that
+    can't be reliably backtested even after rescaling, because intraday
+    halts may not have been adjusted consistently.
+    """
     results = {s.name: [] for s in strategies}
-    skipped = 0
+    skipped_no_bars = 0
+    skipped_split = 0
+    rescaled_count = 0
+
+    # Sanity bands: ratio must fall within [1/drop_threshold² , drop_threshold²]
+    lo = 1.0 / (drop_threshold ** 2)
+    hi = drop_threshold ** 2
 
     for trade in trades:
         ticker = trade["ticker"]
@@ -614,18 +686,34 @@ def run_backtest(
         key = (ticker, date)
 
         if key not in bars_map:
-            skipped += 1
+            skipped_no_bars += 1
             continue
 
-        bars = bars_map[key]
+        raw_bars = bars_map[key]
         entry_price = float(trade["entry_price"])
         shares = int(trade["shares"])
+
+        # Anchor bars to recorded entry to undo IBKR's split adjustment
+        bars, ratio = anchor_bars_to_recorded_entry(raw_bars, trade["entry_time"], entry_price)
+
+        if ratio != 1.0:
+            rescaled_count += 1
+            if not (lo <= ratio <= hi):
+                # Likely a corporate action — skip rather than trust the rescaling
+                skipped_split += 1
+                print(f"  ⚠️  Skipping {ticker} {date}: anchor ratio {ratio:.4f} "
+                      f"outside [{lo:.4f}, {hi:.4f}] — likely corporate action")
+                continue
 
         for strat in strategies:
             result = simulate_exit(bars, trade["entry_time"], entry_price, shares, strat, trade)
             results[strat.name].append(result)
 
-    print(f"\nBacktest complete: {len(trades) - skipped} trades simulated, {skipped} skipped (no bars)")
+    n_simulated = len(trades) - skipped_no_bars - skipped_split
+    print(f"\nBacktest complete: {n_simulated} trades simulated, "
+          f"{skipped_no_bars} skipped (no bars), "
+          f"{skipped_split} skipped (corporate action), "
+          f"{rescaled_count} rescaled (split-adjusted bars)")
     return results
 
 

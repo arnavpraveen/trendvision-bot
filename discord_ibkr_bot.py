@@ -100,26 +100,38 @@ BUY_LIMIT_TIMEOUT_SEC = 12     # seconds to wait for DAY limit buy to fill befor
 # SHORT: stop-loss only (buy stop above entry to cap squeeze risk).
 TAKE_PROFIT_PCT     = 20.0   # LONG: sell limit at entry × (1 + TP/100)
 STOP_LOSS_PCT       = 8.0    # LONG: sell stop  at entry × (1 - SL/100)
-SHORT_STOP_LOSS_PCT = 20.0   # SHORT: synthetic stop trigger at entry × (1 + SL/100)
 
-# When the synthetic stop fires, we submit a BUY LIMIT at market × (1 + this/100)
-# to guarantee a fill while capping slippage.  5% is wide enough to clear most
-# pre-market spreads and fast moves; too tight and a runaway stock won't fill.
+# SHORT mode exit configuration.
+#
+# As of 2026-05-09: SHORT_STOP_LOSS_PCT is None (no stop) and trades exit
+# either at the configured time-after-entry or at EOD.  Empirically (n=606
+# over 8 sessions Apr 27–May 7) the synthetic 20% stop was costing ~$525
+# vs holding-and-exiting; the +20-min window rule made it slightly worse
+# than always-on.  A 30-min time exit captured 97% of the no-stop edge
+# with materially better tail control (worst trade −57% vs −491%).
+#
+# To revert: set SHORT_STOP_LOSS_PCT back to 20.0 and SHORT_TIME_EXIT_MIN
+# to None (and re-set SHORT_STOP_WINDOW_MIN if you want the window rule).
+SHORT_STOP_LOSS_PCT = None   # disabled — set to 20.0 to re-enable the synthetic stop
+
+# When the synthetic stop fires (only used if SHORT_STOP_LOSS_PCT is set),
+# the BUY LIMIT cover goes out at market × (1 + this/100).
 SHORT_STOP_LIMIT_BUFFER_PCT = 5.0
 
-# Time-window stop rule (SHORT only): only enforce the synthetic stop if the
-# trigger is breached within this many minutes of entry.  After the window
-# expires, the position is held to EOD regardless of price action.
-#
-# Rationale: empirically (Apr 21–24 inspector analysis, n=24 stops) the
-# synthetic stop earned its keep on fast-gap squeezes (trigger crossed within
-# minutes of entry — the EFOI/SCNI/NTIP class) but bled money on slow grinds
-# that crossed trigger after 30+ minutes and then mean-reverted by EOD.
-# A 20-min window simulated +$180 improvement on that sample, with a 9-of-11
-# hit rate on decisive cases.  See trade_inspector.py --what-if-stop-window-min.
-#
-# Set to None to disable (current bot behavior — stop active for full hold).
-SHORT_STOP_WINDOW_MIN = 20.0   # minutes; None disables the time-window rule
+# Time-window for the synthetic stop (only used if SHORT_STOP_LOSS_PCT is set).
+# None = always-on; numeric = SL active only for this many minutes after entry.
+SHORT_STOP_WINDOW_MIN = None   # disabled along with the stop itself
+
+# Time-based exit (SHORT only).  N minutes after entry, submit a marketable
+# BUY LIMIT cover regardless of price.  None disables.  Backtest indicated
+# 30 min was the sweet spot — captures most of the strategy edge before
+# late-day squeeze risk dominates.
+SHORT_TIME_EXIT_MIN = 30.0
+
+# Buffer on the time-exit BUY LIMIT cover (market × (1 + buffer/100)).
+# Wider than the stop buffer because price has had time to drift, so we
+# care less about precision and more about guaranteed fill.
+SHORT_TIME_EXIT_LIMIT_BUFFER_PCT = 2.0
 
 # End-of-day forced close – single market sell submitted at this time (ET).
 # tif='DAY' so unfilled sells auto-cancel at market close.
@@ -457,6 +469,7 @@ def save_positions_state():
                 'stop_price'   : pos.get('stop_price'),
                 'stop_triggered': pos.get('stop_triggered', False),
                 'stop_window_expired': pos.get('stop_window_expired', False),
+                'time_exit_fired': pos.get('time_exit_fired', False),
             }
         with open(POSITIONS_STATE_FILE, 'w') as f:
             json.dump(state, f, indent=2)
@@ -526,6 +539,7 @@ def load_positions_state():
                             'stop_price'      : pos_data.get('stop_price'),
                             'stop_triggered'  : pos_data.get('stop_triggered', False),
                             'stop_window_expired': pos_data.get('stop_window_expired', False),
+                            'time_exit_fired' : pos_data.get('time_exit_fired', False),
                             'direction'       : TRADE_DIRECTION,
                         }
                         logger.info(f"  ✅ {ticker}: {pos_data['shares']} shares @ {fmt(pos_data['entry_price'])}")
@@ -940,6 +954,95 @@ def check_synthetic_stops():
                     save_positions_state()
         except Exception as e:
             logger.error(f"   ❌ {ticker}: synthetic stop cover failed: {e}")
+
+# ============ TIME-BASED EXIT (SHORT) ============
+def check_time_exits():
+    """Submit a marketable BUY LIMIT cover for any open SHORT position whose
+    age exceeds SHORT_TIME_EXIT_MIN.  Fire-and-forget, gated by
+    time_exit_fired so each position only fires once.
+
+    Why this exists:
+      Empirically (n=606 over 8 sessions Apr 27–May 7) holding SHORTs to
+      EOD captured the most absolute profit but exposed us to late-day
+      squeeze disasters (e.g. SKK 5x'd between minute 60 and EOD on May 4).
+      Cutting positions at minute 30 sacrifices very little of the strategy
+      edge (~$32 of $1400 = 2%) while reducing worst-case single-trade move
+      from −491% to −57%.  Sharpe ~3x better.
+
+    Design:
+      - Reads ib.portfolio() marketPrice for the ask side; submits a BUY
+        LIMIT at marketPrice × (1 + SHORT_TIME_EXIT_LIMIT_BUFFER_PCT/100).
+      - 2% default buffer: wider than the synthetic-stop buffer because by
+        minute 30 the position is no longer in fast-tape territory; we want
+        a guaranteed fill, not a precise level.
+      - Fires only once per position; sl_order_id is reused for tracking
+        so the existing check_bracket_fills path picks up the cover and
+        logs it as BRACKET_SL (the action label is "BRACKET_SL" but this
+        is mechanically a time-driven exit; downstream analysis can
+        distinguish via the stop_percent field which now reads "TIME:30min").
+    Must only be called from the IBKR thread."""
+    if not ib.isConnected():
+        return
+    if TRADE_DIRECTION != 'SHORT':
+        return
+    if SHORT_TIME_EXIT_MIN is None:
+        return
+
+    now = get_et()
+
+    with positions_lock:
+        candidates = [
+            (t, p) for t, p in active_positions.items()
+            if p.get('direction') == 'SHORT'
+               and not p.get('time_exit_fired')
+               and not p.get('stop_triggered')   # don't double-fire if SL also fired
+               and p.get('entry_time') is not None
+               and (now - p['entry_time']).total_seconds() / 60 >= SHORT_TIME_EXIT_MIN
+        ]
+
+    if not candidates:
+        return
+
+    # Fetch portfolio once for ask-side marketPrice
+    try:
+        portfolio = {p.contract.symbol: p for p in ib.portfolio()}
+    except Exception as e:
+        logger.debug(f"Time exit: portfolio fetch failed: {e}")
+        return
+
+    for ticker, pos in candidates:
+        ibkr_pos = portfolio.get(ticker)
+        if ibkr_pos is None:
+            continue
+        market_price = ibkr_pos.marketPrice
+        if market_price is None or math.isnan(market_price) or market_price <= 0:
+            # Fall back to entry price if portfolio data is stale; the cover
+            # at entry × buffer is still better than letting the position drift.
+            market_price = pos['entry_price']
+
+        limit_price = round(market_price * (1 + SHORT_TIME_EXIT_LIMIT_BUFFER_PCT / 100), 2)
+        age_min = (now - pos['entry_time']).total_seconds() / 60
+        try:
+            cover_order            = LimitOrder('BUY', pos['shares'], limit_price)
+            cover_order.tif        = 'DAY'
+            cover_order.outsideRth = True
+            cover_trade            = ib.placeOrder(pos['contract'], cover_order)
+            cover_order_id         = cover_trade.order.orderId
+
+            logger.warning(
+                f"⏱️  {ticker}: time exit fired  "
+                f"(age {age_min:.1f}min ≥ {SHORT_TIME_EXIT_MIN:g}min)  "
+                f"→ BUY LIMIT {pos['shares']} @ {fmt(limit_price)} "
+                f"(market {fmt(market_price)}, ID: {cover_order_id})"
+            )
+
+            with positions_lock:
+                if ticker in active_positions:
+                    active_positions[ticker]['time_exit_fired'] = True
+                    active_positions[ticker]['sl_order_id']     = cover_order_id
+                    save_positions_state()
+        except Exception as e:
+            logger.error(f"   ❌ {ticker}: time exit cover failed: {e}")
 
 # ============ END-OF-DAY CLOSE ============
 _eod_closed_today = None   # date when EOD sells were submitted (prevents re-submission)
@@ -1418,9 +1521,9 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
             stop_price  = None   # SHORT synthetic stop trigger (None for LONG)
 
             if is_short:
-                # SHORT: synthetic stop — arm a trigger price; check_synthetic_stops()
-                # monitors each position's price in the main loop and fires a
-                # marketable BUY LIMIT cover when market ≥ stop_price.
+                # SHORT: synthetic stop (optional) + time exit (optional).
+                # Both checked from the main loop; both fire BUY LIMIT covers
+                # at market × (1 + buffer/100) with outsideRth=True.
                 #
                 # Why not a real StopOrder?  IBKR stop orders only *trigger* during
                 # RTH (09:30–16:00 ET), regardless of outsideRth=True.  On 2026-04-17
@@ -1429,17 +1532,25 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                 # dormant, then filled at $5.41 at 09:30 RTH open (−105% loss).  A
                 # plain LimitOrder with outsideRth=True DOES execute outside RTH,
                 # so we monitor price ourselves and fire a limit cover the instant
-                # the trigger is crossed.
-                stop_price = round(fill_price * (1 + SHORT_STOP_LOSS_PCT / 100), 4)
-                _window_str = (
-                    f", active for {SHORT_STOP_WINDOW_MIN:g}min from entry"
-                    if SHORT_STOP_WINDOW_MIN is not None else ""
-                )
-                logger.info(
-                    f"   🛡️  Synthetic SL armed: cover when market ≥ {fmt(stop_price)}  "
-                    f"(+{SHORT_STOP_LOSS_PCT}%{_window_str})"
-                )
-                # sl_order_id stays None until check_synthetic_stops() fires.
+                # the trigger is crossed (or, for time exit, the timer fires).
+                if SHORT_STOP_LOSS_PCT is not None:
+                    stop_price = round(fill_price * (1 + SHORT_STOP_LOSS_PCT / 100), 4)
+                    _window_str = (
+                        f", active for {SHORT_STOP_WINDOW_MIN:g}min from entry"
+                        if SHORT_STOP_WINDOW_MIN is not None else ""
+                    )
+                    logger.info(
+                        f"   🛡️  Synthetic SL armed: cover when market ≥ {fmt(stop_price)}  "
+                        f"(+{SHORT_STOP_LOSS_PCT}%{_window_str})"
+                    )
+                    # sl_order_id stays None until check_synthetic_stops() fires.
+
+                if SHORT_TIME_EXIT_MIN is not None:
+                    logger.info(
+                        f"   ⏱️  Time exit armed: cover at +{SHORT_TIME_EXIT_MIN:g}min from entry "
+                        f"(market × {1 + SHORT_TIME_EXIT_LIMIT_BUFFER_PCT/100:.2f} BUY LIMIT)"
+                    )
+                    # time_exit_fired stays False until check_time_exits() fires.
 
             else:
                 # LONG: take-profit + stop-loss bracket (OCA)
@@ -1510,6 +1621,10 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                     # set, the synthetic stop stops monitoring this position
                     # and EOD close handles it.
                     'stop_window_expired': False,
+                    # Time-exit state (SHORT only).  check_time_exits() flips
+                    # this once it submits a BUY LIMIT cover at the configured
+                    # number of minutes after entry.  Used to prevent re-fire.
+                    'time_exit_fired': False,
                     'direction'   : TRADE_DIRECTION,
                 }
                 save_positions_state()
@@ -1573,6 +1688,29 @@ def log_trade(ticker, action, shares, price, timestamp):
         'total_value': round(shares * price, 2),
     })
 
+def _exit_config_tag():
+    """Build a compact string describing the SHORT exit configuration in
+    effect right now.  Used as the `stop_percent` CSV column value so
+    historical analysis can distinguish trades made under different rules.
+
+    Examples:
+        SL=None,      WIN=None,  TIME=30  → "TIME:30min"
+        SL=20,        WIN=None,  TIME=None → "SL:20%"
+        SL=20,        WIN=20,    TIME=None → "SL:20%@≤20min"
+        SL=20,        WIN=20,    TIME=30   → "SL:20%@≤20min/TIME:30min"
+        SL=None,      WIN=None,  TIME=None → "EOD_ONLY"
+    """
+    parts = []
+    if SHORT_STOP_LOSS_PCT is not None:
+        tag = f'SL:{SHORT_STOP_LOSS_PCT:g}%'
+        if SHORT_STOP_WINDOW_MIN is not None:
+            tag += f'@≤{SHORT_STOP_WINDOW_MIN:g}min'
+        parts.append(tag)
+    if SHORT_TIME_EXIT_MIN is not None:
+        parts.append(f'TIME:{SHORT_TIME_EXIT_MIN:g}min')
+    return '/'.join(parts) if parts else 'EOD_ONLY'
+
+
 def log_detailed_trade(ticker, action, shares,
                         entry_price=None, exit_price=None,
                         entry_time=None,  exit_time=None,
@@ -1602,18 +1740,14 @@ def log_detailed_trade(ticker, action, shares,
         'pnl_pct'           : round(pnl_pct,        2) if pnl_pct        is not None else '',
         'hold_time_sec'     : int(hold_time_sec)        if hold_time_sec  is not None else '',
         'hold_time_min'     : int(hold_time_sec / 60)   if hold_time_sec  is not None else '',
-        # Reflect the actual stop configuration in effect for this trade.
-        # SHORT mode: synthetic BUY-limit stop at +SHORT_STOP_LOSS_PCT%, with
-        # an optional time-window gate (SHORT_STOP_WINDOW_MIN).
-        # LONG mode:  OCA bracket with TP/SL pair.
-        # Previously this was hardcoded to 'EOD_ONLY' which was wrong for
-        # every trade since the 20% stop was added.
-        'stop_percent'      : (
-            (f'SL:{SHORT_STOP_LOSS_PCT:g}%'
-             + (f'@≤{SHORT_STOP_WINDOW_MIN:g}min' if SHORT_STOP_WINDOW_MIN is not None else ''))
-            if TRADE_DIRECTION == 'SHORT'
-            else f'TP:{TAKE_PROFIT_PCT:g}%/SL:{STOP_LOSS_PCT:g}%'
-        ),
+        # Reflect the actual exit configuration in effect for this trade.
+        # SHORT mode: any of {synthetic SL, SL window, time exit, EOD-only}
+        # depending on which config knobs are set.  Format is a slash-joined
+        # tag like "TIME:30min" or "SL:20%@≤20min/TIME:30min" so downstream
+        # analysis can identify the regime.
+        # LONG mode: OCA bracket with TP/SL pair.
+        'stop_percent'      : _exit_config_tag() if TRADE_DIRECTION == 'SHORT'
+                              else f'TP:{TAKE_PROFIT_PCT:g}%/SL:{STOP_LOSS_PCT:g}%',
         'order_id'          : order_id      or '',
         'stop_order_id'     : stop_order_id or '',
         'pct_change'        : pct_change,
@@ -1826,6 +1960,12 @@ def connect_ibkr_thread():
             # Handles the pre-market gap-through that a hardware StopOrder can't
             # catch (see Apr 17 EFOI incident).
             check_synthetic_stops()
+
+            # ── Check time-based exits (SHORT only) ────────────────────────────
+            # Fires marketable BUY LIMIT covers for positions older than
+            # SHORT_TIME_EXIT_MIN minutes.  Exits before late-day squeeze risk
+            # dominates.  See May 9 backtest analysis.
+            check_time_exits()
 
             # ── EOD close runs FIRST ─────────────────────────────────────────
             # This must happen before order processing so that a blocked
