@@ -41,6 +41,15 @@ class ExitStrategy:
     time_stop_minutes: Optional[float] = None  # exit after N minutes
     eod_close: bool = True                     # force close at 15:45 ET if still open
     short: bool = False                        # True = short sell at entry, buy to cover at exit
+    # NEW: time-window stop — SL only active for first N minutes after entry.
+    # After window expires, SL is suppressed (trade rides to EOD or other exit).
+    # Mirrors the live bot's SHORT_STOP_WINDOW_MIN behaviour.
+    stop_window_minutes: Optional[float] = None
+    # NEW: breakeven trigger — once price moves favorably by this %, the SL
+    # moves to entry_price (locking in breakeven).  Independent of the time
+    # window: once breakeven fires it stays armed for the rest of the hold.
+    # Tests the "lock in unrealized profits before they reverse" hypothesis.
+    breakeven_trigger_pct: Optional[float] = None
 
     def describe(self) -> str:
         parts = []
@@ -49,7 +58,12 @@ class ExitStrategy:
         if self.take_profit_pct is not None:
             parts.append(f"TP +{self.take_profit_pct}%")
         if self.stop_loss_pct is not None:
-            parts.append(f"SL -{self.stop_loss_pct}%")
+            sl = f"SL -{self.stop_loss_pct}%"
+            if self.stop_window_minutes is not None:
+                sl += f"@≤{self.stop_window_minutes:g}min"
+            parts.append(sl)
+        if self.breakeven_trigger_pct is not None:
+            parts.append(f"BE@+{self.breakeven_trigger_pct}%")
         if self.trailing_stop_pct is not None:
             parts.append(f"Trail -{self.trailing_stop_pct}%")
         if self.time_stop_minutes is not None:
@@ -140,6 +154,51 @@ STRATEGIES = [
     # Short bracket + time
     ExitStrategy(name="S_TP10_SL5_T30", take_profit_pct=10.0, stop_loss_pct=5.0, time_stop_minutes=30, short=True),
     ExitStrategy(name="S_TP10_SL8_T60", take_profit_pct=10.0, stop_loss_pct=8.0, time_stop_minutes=60, short=True),
+
+    # ──────────────────────────────────────────────────────────────────────
+    # POST–MAY 7 ANALYSIS: stop-policy comparison for SHORT mode
+    # ──────────────────────────────────────────────────────────────────────
+    # Question 1: How does stop level alone affect P&L? (no window, hold to EOD)
+    ExitStrategy(name="S_SL10",      stop_loss_pct=10.0, short=True),
+    ExitStrategy(name="S_SL12",      stop_loss_pct=12.0, short=True),
+    ExitStrategy(name="S_SL15",      stop_loss_pct=15.0, short=True),
+    ExitStrategy(name="S_SL20",      stop_loss_pct=20.0, short=True),  # pre-window-rule bot
+    ExitStrategy(name="S_SL25",      stop_loss_pct=25.0, short=True),
+    ExitStrategy(name="S_SL30",      stop_loss_pct=30.0, short=True),
+
+    # Question 2: Does the time-window rule actually help, vs always-on SL?
+    # Compare against current bot (S_SL20_W20) and across windows.
+    ExitStrategy(name="S_SL20_W5",   stop_loss_pct=20.0, stop_window_minutes=5,  short=True),
+    ExitStrategy(name="S_SL20_W10",  stop_loss_pct=20.0, stop_window_minutes=10, short=True),
+    ExitStrategy(name="S_SL20_W15",  stop_loss_pct=20.0, stop_window_minutes=15, short=True),
+    ExitStrategy(name="S_SL20_W20",  stop_loss_pct=20.0, stop_window_minutes=20, short=True),  # CURRENT BOT
+    ExitStrategy(name="S_SL20_W30",  stop_loss_pct=20.0, stop_window_minutes=30, short=True),
+    ExitStrategy(name="S_SL20_W60",  stop_loss_pct=20.0, stop_window_minutes=60, short=True),
+
+    # Question 3: Tighter stops with the same window — does combining them help?
+    ExitStrategy(name="S_SL12_W20",  stop_loss_pct=12.0, stop_window_minutes=20, short=True),
+    ExitStrategy(name="S_SL15_W20",  stop_loss_pct=15.0, stop_window_minutes=20, short=True),
+    ExitStrategy(name="S_SL10_W10",  stop_loss_pct=10.0, stop_window_minutes=10, short=True),
+    ExitStrategy(name="S_SL15_W10",  stop_loss_pct=15.0, stop_window_minutes=10, short=True),
+
+    # Question 4: Breakeven trigger (the "trail-the-MFE" idea).  Once price
+    # has dropped X% from entry (favorable for short), SL moves to entry_price.
+    # Pure BE — no fixed disaster stop.
+    ExitStrategy(name="S_BE3",       breakeven_trigger_pct=3.0,  short=True),
+    ExitStrategy(name="S_BE5",       breakeven_trigger_pct=5.0,  short=True),
+    ExitStrategy(name="S_BE8",       breakeven_trigger_pct=8.0,  short=True),
+    ExitStrategy(name="S_BE10",      breakeven_trigger_pct=10.0, short=True),
+
+    # Question 5: BE trigger + always-on disaster stop (catches both runaway
+    # squeezes AND captures unrealized gains before reversal).
+    ExitStrategy(name="S_BE3_SL20",  breakeven_trigger_pct=3.0,  stop_loss_pct=20.0, short=True),
+    ExitStrategy(name="S_BE5_SL20",  breakeven_trigger_pct=5.0,  stop_loss_pct=20.0, short=True),
+    ExitStrategy(name="S_BE8_SL20",  breakeven_trigger_pct=8.0,  stop_loss_pct=20.0, short=True),
+    ExitStrategy(name="S_BE5_SL15",  breakeven_trigger_pct=5.0,  stop_loss_pct=15.0, short=True),
+
+    # Question 6: BE + window-stop combo (most interesting — combines all 3 ideas)
+    ExitStrategy(name="S_BE5_SL20_W20", breakeven_trigger_pct=5.0, stop_loss_pct=20.0, stop_window_minutes=20, short=True),
+    ExitStrategy(name="S_BE3_SL20_W20", breakeven_trigger_pct=3.0, stop_loss_pct=20.0, stop_window_minutes=20, short=True),
 ]
 
 EOD_CLOSE_HOUR = 15
@@ -373,6 +432,19 @@ def simulate_exit(
     peak_pnl_pct = 0.0
     trough_pnl_pct = 0.0
 
+    # Breakeven-trigger state.  Armed once price has moved favorably by
+    # breakeven_trigger_pct; once armed, the SL is moved to entry_price.
+    # Stays armed for the rest of the hold (independent of stop window).
+    breakeven_armed = False
+    breakeven_trigger_price = None
+    if strategy.breakeven_trigger_pct is not None:
+        if is_short:
+            # Favorable for short = price drops; trigger when bar_low ≤ this
+            breakeven_trigger_price = entry_price * (1 - strategy.breakeven_trigger_pct / 100)
+        else:
+            # Favorable for long = price rises; trigger when bar_high ≥ this
+            breakeven_trigger_price = entry_price * (1 + strategy.breakeven_trigger_pct / 100)
+
     exit_price = None
     exit_reason = None
     exit_time = None
@@ -382,11 +454,26 @@ def simulate_exit(
         bar_low = bar["low"]
         bar_close = bar["close"]
 
+        # Time-window check for original SL.  None means always-on.
+        if strategy.stop_window_minutes is not None:
+            elapsed_min = (ts - entry_time).total_seconds() / 60
+            sl_in_window = elapsed_min <= strategy.stop_window_minutes
+        else:
+            sl_in_window = True
+
         if is_short:
             # Update trailing stop from trough
             if strategy.trailing_stop_pct and bar_low < trough_price:
                 trough_price = bar_low
                 trail_stop_price = trough_price * (1 + strategy.trailing_stop_pct / 100)
+
+            # Arm breakeven trigger if price has dropped to/below trigger level.
+            # We arm during the bar, then check the BE stop using bar_high in
+            # the same bar — slightly optimistic on same-bar arm+exit but only
+            # matters in the rare case where one bar contains both moves.
+            if (breakeven_trigger_price is not None and not breakeven_armed
+                    and bar_low <= breakeven_trigger_price):
+                breakeven_armed = True
 
             # Track unrealized P&L (inverted for short)
             high_pnl_pct = (entry_price - bar_low) / entry_price * 100    # best case in bar
@@ -394,21 +481,30 @@ def simulate_exit(
             peak_pnl_pct = max(peak_pnl_pct, high_pnl_pct)
             trough_pnl_pct = min(trough_pnl_pct, low_pnl_pct)
 
-            # 1) Stop-loss: price rises above SL (check HIGH — worst case)
-            if sl_price and bar_high >= sl_price:
+            # 1) Breakeven stop (once armed) — fires when price returns to entry.
+            #    Has priority over the original SL because BE_price < SL_price
+            #    for shorts, so BE will be hit first on an upward move.
+            if breakeven_armed and bar_high >= entry_price:
+                exit_price = entry_price
+                exit_reason = "BE"
+                exit_time = ts
+                break
+
+            # 2) Stop-loss: only active inside the configured window
+            if sl_price and sl_in_window and bar_high >= sl_price:
                 exit_price = sl_price
                 exit_reason = "SL"
                 exit_time = ts
                 break
 
-            # 2) Trailing stop: price rises above trail
+            # 3) Trailing stop: price rises above trail
             if trail_stop_price and bar_high >= trail_stop_price:
                 exit_price = trail_stop_price
                 exit_reason = "TRAIL"
                 exit_time = ts
                 break
 
-            # 3) Take-profit: price drops below TP (check LOW)
+            # 4) Take-profit: price drops below TP (check LOW)
             if tp_price and bar_low <= tp_price:
                 exit_price = tp_price
                 exit_reason = "TP"
@@ -416,31 +512,44 @@ def simulate_exit(
                 break
 
         else:
-            # LONG logic (unchanged)
+            # LONG logic — mirror image of SHORT
             if strategy.trailing_stop_pct and bar_high > peak_price:
                 peak_price = bar_high
                 trail_stop_price = peak_price * (1 - strategy.trailing_stop_pct / 100)
+
+            # Arm breakeven trigger when price has risen to trigger level
+            if (breakeven_trigger_price is not None and not breakeven_armed
+                    and bar_high >= breakeven_trigger_price):
+                breakeven_armed = True
 
             high_pnl_pct = (bar_high - entry_price) / entry_price * 100
             low_pnl_pct = (bar_low - entry_price) / entry_price * 100
             peak_pnl_pct = max(peak_pnl_pct, high_pnl_pct)
             trough_pnl_pct = min(trough_pnl_pct, low_pnl_pct)
 
-            # 1) Stop-loss (check LOW first — worst case within bar)
-            if sl_price and bar_low <= sl_price:
+            # 1) Breakeven stop (once armed) — fires when price drops back to entry.
+            #    BE_price > SL_price for longs, so BE fires before SL on a drop.
+            if breakeven_armed and bar_low <= entry_price:
+                exit_price = entry_price
+                exit_reason = "BE"
+                exit_time = ts
+                break
+
+            # 2) Stop-loss: only active inside window
+            if sl_price and sl_in_window and bar_low <= sl_price:
                 exit_price = sl_price
                 exit_reason = "SL"
                 exit_time = ts
                 break
 
-            # 2) Trailing stop
+            # 3) Trailing stop
             if trail_stop_price and bar_low <= trail_stop_price:
                 exit_price = trail_stop_price
                 exit_reason = "TRAIL"
                 exit_time = ts
                 break
 
-            # 3) Take-profit (check HIGH)
+            # 4) Take-profit (check HIGH)
             if tp_price and bar_high >= tp_price:
                 exit_price = tp_price
                 exit_reason = "TP"
