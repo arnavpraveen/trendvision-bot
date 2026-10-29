@@ -2141,16 +2141,15 @@ def parse_alert(message_content):
     if m:
         alert_reason = m.group(1).strip()
 
-    # SEC filings – anchored to "FORM" to prevent over-capturing
+    # SEC filings – anchored to "FORM"; they arrive as markdown links
+    # like "[FORM 8-K](https://www.sec.gov/...)", so keep only the form name.
     sec_filing = ''
     m = re.search(
-        r"Today'?s?\s*SEC\s*Fil(?:ing)?\s*[:\n]\s*((?:FORM[^\n]+\n?)+)",
+        r"Today'?s?\s*SEC\s*Fil(?:ing)?\s*[:\n]\s*((?:\[?FORM[^\n]+\n?)+)",
         message_content, re.IGNORECASE
     )
     if m:
-        sec_filing = ', '.join(
-            f.strip() for f in m.group(1).strip().splitlines() if f.strip()
-        )
+        sec_filing = ', '.join(re.findall(r'FORM [^\]\n]+', m.group(1)))
 
     # News headlines (bullet-separated)
     news = ''

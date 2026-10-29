@@ -203,9 +203,10 @@ def parse(text):
         headlines = [h.strip() for h in re.split(r'\s*•\s*', m.group(1).strip()) if h.strip()]
         row["news"] = ' | '.join(headlines)
 
-    m = re.search(r"Today'?s?\s*SEC\s*Fil(?:ing)?\s*[:\n]\s*((?:FORM[^\n]+\n?)+)", text, re.IGNORECASE)
+    # Filings arrive as markdown links: "[FORM 8-K](https://www.sec.gov/...)"
+    m = re.search(r"Today'?s?\s*SEC\s*Fil(?:ing)?\s*[:\n]\s*((?:\[?FORM[^\n]+\n?)+)", text, re.IGNORECASE)
     if m:
-        row["sec_filing"] = ', '.join(f.strip() for f in m.group(1).strip().splitlines() if f.strip())
+        row["sec_filing"] = ', '.join(re.findall(r'FORM [^\]\n]+', m.group(1)))
 
     row["recent_ipo"]  = _field(text, r'Recent\s*IPO\s*[:\n]\s*([^\n]+)')
     row["recent_rs"]   = _field(text, r'Recent\s*R/S\s*[:\n]\s*([^\n]+)')
