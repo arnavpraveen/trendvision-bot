@@ -630,7 +630,7 @@ def reconcile_portfolio():
         return
 
     # Tickers to never auto-sell (e.g. legacy positions from prior bugs)
-    RECONCILE_IGNORE = {'APBO'}
+    RECONCILE_IGNORE = {'ABPO'}  # legacy 178-share long on PINK
 
     with positions_lock:
         tracked = set(active_positions.keys())
