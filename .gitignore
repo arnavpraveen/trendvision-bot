@@ -1,6 +1,7 @@
 notes.txt
 .DS_Store
 venv/
+venv_bot/
 logs/
 __pycache__/
 *.pyc
@@ -11,3 +12,4 @@ run_data/
 .env.*
 !.env.example
 trade_charts/
+bars_alpaca/

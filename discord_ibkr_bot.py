@@ -89,6 +89,8 @@ TRADE_AMOUNT          = 100    # dollars per trade (shares = floor(TRADE_AMOUNT 
 IOC_LIMIT_PCT         = 3.0    # max % below alert price for limit sell (fallback when no quote)
 MIN_PRICE             = 0.01   # alerts below this price are ignored
 MAX_PRICE             = 500.0  # alerts above this price are ignored
+MIN_PCT_CHANGE        = 25.0   # only trade alerts already up this much (None = trade all).
+                               # Event study Feb-Oct: only 25%+ movers beat the spread (median +4.3% bid/ask, 30 min).
 
 # Real-time quote settings
 QUOTE_WAIT_SEC        = 1.0    # max seconds to wait for streaming bid after reqMktData
@@ -711,6 +713,9 @@ def connect_with_retry(max_retries=10, initial_delay=5):
 
             if ib.isConnected():
                 ib.RequestTimeout = 20  # seconds – prevents zombie hangs
+                # Free delayed data: gives shortable shares without a subscription.
+                # place_order never prices off a delayed bid/ask (checks marketDataType).
+                ib.reqMarketDataType(3)
                 account = ib.managedAccounts()[0]
                 net_liq = next(
                     (float(v.value) for v in ib.accountValues()
@@ -1347,17 +1352,21 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
         # ── Request streaming quote ────────────────────────────────────────
         # SHORT uses bid for pricing; LONG uses ask.
         snap_bid = snap_ask = snap_last = float('nan')
-        ticker_data = ib.reqMktData(contract, '', snapshot=False, regulatorySnapshot=False)
+        ticker_data = ib.reqMktData(contract, '236', snapshot=False, regulatorySnapshot=False)  # 236 = shortable shares
 
         try:
             # Poll for quote to populate
             quote_deadline = time.monotonic() + QUOTE_WAIT_SEC
-            while math.isnan(ticker_data.bid if is_short else ticker_data.ask) and time.monotonic() < quote_deadline:
+            while ((math.isnan(ticker_data.bid if is_short else ticker_data.ask) or math.isnan(ticker_data.shortableShares))
+                   and time.monotonic() < quote_deadline):
                 ib.sleep(QUOTE_POLL_INTERVAL)
 
-            snap_bid  = ticker_data.bid
-            snap_ask  = ticker_data.ask
-            snap_last = ticker_data.last
+            # Delayed (type 3/4) quotes are 15 min old – never price off them.
+            live = ticker_data.marketDataType in (1, 2)
+            snap_bid  = ticker_data.bid  if live else float('nan')
+            snap_ask  = ticker_data.ask  if live else float('nan')
+            snap_last = ticker_data.last if live else float('nan')
+            shortable_shares = ticker_data.shortableShares
 
             if is_short:
                 # SHORT: limit sell at bid × BID_LIMIT_MULTIPLIER (slightly below bid)
@@ -1399,6 +1408,7 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                         + (f"  {pct_change}" if pct_change else '') + ")")
             if not math.isnan(snap_bid) and snap_bid > 0:
                 logger.info(f"   Quote: bid={fmt(snap_bid)} ask={fmt(snap_ask)} last={fmt(snap_last) if not math.isnan(snap_last) else 'N/A'}")
+            logger.info(f"   Shortable shares: {'N/A' if math.isnan(shortable_shares) else int(shortable_shares)}")
             if mcap:         logger.info(f"   MCap  : {mcap}")
             if float_shares: logger.info(f"   Float : {float_shares}")
             if min_vol:      logger.info(f"   MinVol: {min_vol}  RelVol: {rel_vol}  MonVol: {mon_vol}")
@@ -1473,7 +1483,7 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                     else:
                         reason_short = reason_short[:100]
                     logger.info(f"   🚫 Trade restricted: {reason_short}")
-                    log_failed_trade(ticker, 'TRADE_RESTRICTED', reason_short,
+                    log_failed_trade(ticker, 'TRADE_RESTRICTED', f'{reason_short}, shortable {shortable_shares}',
                                      order_id,
                                      snap_bid=snap_bid, snap_ask=snap_ask, snap_last=snap_last)
                     with stats_lock:
@@ -1501,7 +1511,7 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                     direction = "below" if is_short else "above"
                     logger.info(f"   ⏭️  No fill – price {direction} DAY limit {fmt(limit_price)} (status: {status})")
                     log_failed_trade(ticker, 'DAY_LIMIT_NO_FILL',
-                                     f'Price {direction} limit {limit_price}', order_id,
+                                     f'Price {direction} limit {limit_price}, shortable {shortable_shares}', order_id,
                                      snap_bid=snap_bid, snap_ask=snap_ask, snap_last=snap_last)
                     with stats_lock:
                         stats['orders_failed'] += 1
@@ -1831,9 +1841,14 @@ async def on_ready():
     logger.info(f"   Account    : {client.user}")
     logger.info(f"   Session    : {stats['session_start'].strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info(f"   Trade size : ${TRADE_AMOUNT}")
-    logger.info(f"   Entry      : DAY limit (ask × {ASK_LIMIT_MULTIPLIER}, fallback: alert + {IOC_LIMIT_PCT}%)")
-    logger.info(f"   Exit       : Bracket TP +{TAKE_PROFIT_PCT}% / SL -{STOP_LOSS_PCT}%, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
+    if TRADE_DIRECTION == 'SHORT':
+        logger.info(f"   Entry      : SHORT DAY limit (bid × {BID_LIMIT_MULTIPLIER}, fallback: alert - {IOC_LIMIT_PCT}%)")
+        logger.info(f"   Exit       : cover after {SHORT_TIME_EXIT_MIN}min, stop {SHORT_STOP_LOSS_PCT}%, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
+    else:
+        logger.info(f"   Entry      : DAY limit (ask × {ASK_LIMIT_MULTIPLIER}, fallback: alert + {IOC_LIMIT_PCT}%)")
+        logger.info(f"   Exit       : Bracket TP +{TAKE_PROFIT_PCT}% / SL -{STOP_LOSS_PCT}%, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
     logger.info(f"   Price range: {fmt(MIN_PRICE)} – {fmt(MAX_PRICE)}")
+    logger.info(f"   Min move   : {MIN_PCT_CHANGE}%")
     logger.info(f"   Hours      : 04:00–16:00 ET (pre-market + RTH)")
     log_separator("=")
 
@@ -2191,6 +2206,9 @@ def parse_alert(message_content):
     if m:
         sign = '+' if m.group(1) == '↑' else '-'
         pct_change = f"{sign}{m.group(2)}%"
+    if MIN_PCT_CHANGE is not None and not (pct_change and float(pct_change.rstrip('%')) >= MIN_PCT_CHANGE):
+        logger.info(f"ℹ️  {ticker}: move {pct_change or 'N/A'} < {MIN_PCT_CHANGE:g}% – skipping")
+        return None
 
     # Market cap e.g. "276.86K", "7.39M"
     mcap = ''
@@ -2319,7 +2337,7 @@ if __name__ == "__main__":
                 logger.warning(f"⚠️  Could not validate {filepath} header: {e}")
 
     try:
-        client.run(DISCORD_TOKEN)
+        client.run(DISCORD_TOKEN, bot=False)  # personal user token (discord.py 1.x)
     except Exception as e:
         logger.error(f"Discord error: {e}")
         graceful_shutdown()
