@@ -8,7 +8,7 @@ Automated trading bot that reads TrendVision volume alerts from a Discord channe
 
 - Python 3.8+
 - An active Interactive Brokers account with API access enabled
-- A Discord bot token with access to the TrendVision alert channel
+- A Discord account (user token) with access to the TrendVision alert channel
 
 ---
 
@@ -28,11 +28,14 @@ pip install "discord.py<2.0" ib_insync pandas numpy requests
 
 ## Discord Setup
 
-1. Go to [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
-2. Under **Bot**, create a bot and copy the token.
-3. Under **OAuth2 > URL Generator**, select scopes: `bot`, permissions: `Read Messages / View Channels`.
-4. Use the generated URL to add the bot to your server.
-5. Make sure the bot has access to the TrendVision alert channel.
+The bot logs in as **your personal Discord account** (a user token, not a bot token), which is why it needs `discord.py < 2.0`.
+
+1. Open [discord.com/app](https://discord.com/app) in a browser and log in.
+2. Press F12 → **Network** tab → refresh the page.
+3. Click any request to `discord.com` and copy the **Authorization** request header.
+4. Copy `.env.example` to `.env` and paste the value after `DISCORD_TOKEN=`.
+
+`.env` is gitignored. Never commit the token; changing your Discord password invalidates it.
 
 ---
 
@@ -53,8 +56,8 @@ All config is at the top of [discord_ibkr_bot.py](discord_ibkr_bot.py) (lines 76
 
 ```python
 # ============ CONFIGURATION ============
-DISCORD_TOKEN = "REDACTED_DISCORD_TOKEN"     # from Discord Developer Portal
-CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")  # read from .env
+CHANNEL_ID    = 1467323184905850921       # ID of the TrendVision alert channel
 
 # IBKR connection
 IBKR_HOST      = "127.0.0.1"
@@ -85,7 +88,7 @@ python3 discord_ibkr_bot.py
 
 | Script | Purpose |
 |--------|---------|
-| `discord_test.py` | Test that the Discord bot token and channel connection work |
+| `discord_test.py` | Test that the Discord token in .env logs in |
 | `ibkr_test.py` | Test IBKR order submission and stop order mechanics |
 | `export_discord_channel.py` | Export Discord channel messages to CSV for backtesting |
 | `analyze_results.py` | Analyze trading performance from trade history CSV |

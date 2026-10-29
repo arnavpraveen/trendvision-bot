@@ -74,8 +74,11 @@ import math
 import traceback
 
 # ============ CONFIGURATION ============
-DISCORD_TOKEN = "REDACTED_DISCORD_TOKEN"          # ← paste your bot token here
-CHANNEL_ID = int(os.environ.get("DISCORD_CHANNEL_ID", "0"))
+import env  # loads .env
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")  # personal user token, not a bot token
+CHANNEL_ID    = 1467323184905850921
+
+# IBKR connection
 IBKR_HOST      = "127.0.0.1"
 IBKR_PORT      = 4002
 IBKR_CLIENT_ID = 1
@@ -293,9 +296,18 @@ def fmt(amount):
 def pct(value):
     return f"{value:+.2f}%"
 
-def calc_commission(shares):
-    """IBKR commission for one order leg."""
-    return max(MIN_COMMISSION, shares * COMMISSION_PER_SHARE)
+def calc_commission(shares, price):
+    """IBKR Fixed commission for one order leg: $0.005/sh, $1 min, capped at 1% of trade value."""
+    return min(max(MIN_COMMISSION, shares * COMMISSION_PER_SHARE), 0.01 * shares * price)
+
+def round_tick(price, up):
+    """Round to IBKR's tick ($0.0001 under $1, $0.01 otherwise), toward the
+    aggressive side: up for buys, down for sells.  Plain round(x, 2) wiped out
+    the whole limit buffer on sub-$1 stocks (round(0.17 * 1.02, 2) == 0.17)."""
+    step = 0.0001 if price < 1 else 0.01
+    n = price / step
+    n = math.ceil(n - 1e-6) if up else math.floor(n + 1e-6)
+    return round(n * step, 4)
 
 def calc_pnl(entry_price, exit_price, shares):
     """Net P&L and % after round-trip commissions."""
@@ -303,7 +315,7 @@ def calc_pnl(entry_price, exit_price, shares):
         gross = (entry_price - exit_price) * shares
     else:
         gross = (exit_price - entry_price) * shares
-    total_commission = calc_commission(shares) * 2
+    total_commission = calc_commission(shares, entry_price) + calc_commission(shares, exit_price)
     net              = gross - total_commission
     net_pct          = (net / (entry_price * shares)) * 100
     return net, net_pct, total_commission
@@ -889,7 +901,7 @@ def check_synthetic_stops():
                 entry_time = p.get('entry_time')
                 if entry_time is None:
                     continue
-                age_min = (now - entry_time).total_seconds() / 60
+                age_min = _hold_seconds(entry_time, now) / 60
                 if age_min > SHORT_STOP_WINDOW_MIN:
                     p['stop_window_expired'] = True
                     logger.info(
@@ -930,7 +942,7 @@ def check_synthetic_stops():
             continue
 
         # ── Trigger! Submit marketable BUY LIMIT cover. ─────────────────────
-        limit_price = round(market_price * (1 + SHORT_STOP_LIMIT_BUFFER_PCT / 100), 2)
+        limit_price = round_tick(market_price * (1 + SHORT_STOP_LIMIT_BUFFER_PCT / 100), up=True)
         try:
             cover_order            = LimitOrder('BUY', pos['shares'], limit_price)
             cover_order.tif        = 'DAY'
@@ -997,7 +1009,7 @@ def check_time_exits():
                and not p.get('time_exit_fired')
                and not p.get('stop_triggered')   # don't double-fire if SL also fired
                and p.get('entry_time') is not None
-               and (now - p['entry_time']).total_seconds() / 60 >= SHORT_TIME_EXIT_MIN
+               and _hold_seconds(p['entry_time'], now) / 60 >= SHORT_TIME_EXIT_MIN
         ]
 
     if not candidates:
@@ -1020,8 +1032,8 @@ def check_time_exits():
             # at entry × buffer is still better than letting the position drift.
             market_price = pos['entry_price']
 
-        limit_price = round(market_price * (1 + SHORT_TIME_EXIT_LIMIT_BUFFER_PCT / 100), 2)
-        age_min = (now - pos['entry_time']).total_seconds() / 60
+        limit_price = round_tick(market_price * (1 + SHORT_TIME_EXIT_LIMIT_BUFFER_PCT / 100), up=True)
+        age_min = _hold_seconds(pos['entry_time'], now) / 60
         try:
             cover_order            = LimitOrder('BUY', pos['shares'], limit_price)
             cover_order.tif        = 'DAY'
@@ -1356,11 +1368,11 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                 )
                 if usable_bid:
                     price_for_sizing = snap_bid
-                    limit_price = round(snap_bid * BID_LIMIT_MULTIPLIER, 2)
+                    limit_price = round_tick(snap_bid * BID_LIMIT_MULTIPLIER, up=False)
                     price_source = f"bid: {fmt(snap_bid)}"
                 else:
                     price_for_sizing = alert_price
-                    limit_price = round(alert_price * (1 - IOC_LIMIT_PCT / 100), 2)
+                    limit_price = round_tick(alert_price * (1 - IOC_LIMIT_PCT / 100), up=False)
                     price_source = "bid: N/A"
             else:
                 # LONG: limit buy at ask × ASK_LIMIT_MULTIPLIER
@@ -1371,11 +1383,11 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
                 )
                 if usable_ask:
                     price_for_sizing = snap_ask
-                    limit_price = round(snap_ask * ASK_LIMIT_MULTIPLIER, 2)
+                    limit_price = round_tick(snap_ask * ASK_LIMIT_MULTIPLIER, up=True)
                     price_source = f"ask: {fmt(snap_ask)}"
                 else:
                     price_for_sizing = alert_price
-                    limit_price = round(alert_price * (1 + IOC_LIMIT_PCT / 100), 2)
+                    limit_price = round_tick(alert_price * (1 + IOC_LIMIT_PCT / 100), up=True)
                     price_source = "ask: N/A"
 
             shares = max(1, int(TRADE_AMOUNT / price_for_sizing))
@@ -2253,7 +2265,7 @@ if __name__ == "__main__":
     log_separator("=")
 
     if not DISCORD_TOKEN:
-        logger.error("❌ DISCORD_TOKEN is not set – edit the config at the top of this file")
+        logger.error("❌ DISCORD_TOKEN is not set – add it to .env (see .env.example)")
         exit(1)
 
     # Create or validate CSV files with correct headers.
@@ -2273,7 +2285,7 @@ if __name__ == "__main__":
             'pct_change', 'mcap', 'float_shares', 'min_vol', 'rel_vol', 'mon_vol',
             'tags', 'alert_reason', 'sec_filing',
             'news', 'recent_ipo', 'recent_rs', 'zero_borrow',
-            'snap_bid', 'snap_ask', 'snap_last',
+            'snap_bid', 'snap_ask', 'snap_last', 'direction',
         ]),
         (FAILED_TRADES_FILE, [
             'timestamp', 'ticker', 'failure_reason', 'details',

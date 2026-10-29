@@ -40,7 +40,7 @@ except ImportError:
 # ─── Config ───
 BARS_CACHE_DIR = "bars_cache"
 BARS_15S_CACHE_DIR = "bars_cache_15s"
-CHANNEL_EXPORT = "channel_export.csv"
+CHANNEL_EXPORT = "channel_export_1467323184905850921.csv"
 DETAILED_TRADES = "detailed_trades.csv"
 OUTPUT_DIR = "trade_charts"
 
