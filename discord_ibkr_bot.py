@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-# ── Last change: 2026-04-09 ──────────────────────────────────────────────
+# ── Last change: 2026-11-04 ──────────────────────────────────────────────
+# - Signals now come from IBKR's TOP_PERC_GAIN scanner (+25%, US major
+#   exchanges) instead of TrendVision's Discord channel, which went dark.
+#   A stock newly listed on the scan is the signal; poll every SCAN_POLL_SEC.
+# - One short per stock per day (re-entries made 2.8% → 0.7% median in the
+#   Feb–Oct backtest, below ~4 pts of round-trip costs).  Rebuilt from
+#   trade_log.csv, so it survives restarts.
+# - No live quotes without a data subscription, so the limit is the floor
+#   prev close × 1.25 × 0.97: fills at the bid, never below ~+21%.
+# - Skips stocks IBKR reports fewer shortable shares for than we'd sell.
+# - Every signal + decision goes to signals.csv.
+# ── Previous: 2026-04-09 ─────────────────────────────────────────────────
 # - Bracket orders: after every buy fill, submit take-profit (+20%) and
 #   stop-loss (-8%) as OCA-linked orders. IBKR manages them server-side.
 #   check_bracket_fills() in the main loop detects fills and logs P&L.
@@ -32,10 +43,10 @@
 # - EOD cutoff moved from 15:55 → 15:45 ET to match new sell time.
 # ─────────────────────────────────────────────────────────────────────────
 """
-Discord Alert Trading Bot
+IBKR Scanner Short Bot (file name kept from the Discord era)
 =========================================================
-Monitors a Discord channel for TrendVision volume alerts and
-automatically trades them through Interactive Brokers.
+Shorts stocks the moment they appear on IBKR's +25% top-gainers scan,
+covers 30 minutes later.  (Older notes below mention Discord alerts.)
 
 Design principles:
   - Alerts accepted 4:00–15:45 ET (pre-market + RTH, EOD cutoff)
@@ -54,7 +65,6 @@ Order flow:
 =========================================================
 """
 
-import discord
 from ib_insync import *
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -72,11 +82,18 @@ import time
 import asyncio
 import math
 import traceback
+from datetime import timezone
+
+import requests
 
 # ============ CONFIGURATION ============
 import env  # loads .env
-DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "")  # personal user token, not a bot token
-CHANNEL_ID    = 1467323184905850921
+# Signals: IBKR's free scanner (live, no data subscription needed).
+SCAN_POLL_SEC = 10   # seconds between scanner polls
+SCAN_SUB      = ScannerSubscription(instrument='STK', locationCode='STK.US.MAJOR',
+                                    scanCode='TOP_PERC_GAIN')
+# Yesterday's close comes from Alpaca's free SIP daily bars.
+ALPACA_BARS_URL = "https://data.alpaca.markets/v2/stocks/bars"
 
 # IBKR connection
 IBKR_HOST      = "127.0.0.1"
@@ -165,6 +182,7 @@ TRADE_LOG_FILE       = "trade_log.csv"
 DETAILED_LOG_FILE    = "detailed_trades.csv"
 FAILED_TRADES_FILE   = "failed_trades.csv"
 STRATEGY_LOG_FILE    = "strategy_trades.csv"
+SIGNAL_LOG_FILE      = "signals.csv"
 POSITIONS_STATE_FILE = "positions_state.json"
 
 ET = ZoneInfo("America/New_York")
@@ -239,9 +257,9 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# ============ DISCORD CLIENT ============
-client = discord.Client()
+# Every scanner poll ends with this "error" (it's ib_insync cancelling the request).
+logging.getLogger('ib_insync.wrapper').addFilter(
+    lambda r: 'API scanner subscription cancelled' not in r.getMessage())
 
 # ============ IBKR CLIENT ============
 # Track IBKR order rejections by orderId so place_order and EOD close
@@ -268,7 +286,6 @@ pending_tickers  = set()  # tickers queued but not yet in active_positions
 stats_lock = threading.Lock()
 
 ibkr_connected      = False
-ibkr_thread_started = False
 _disconnected_at    = None         # set by monitor_connection on loss
 reconnect_event     = threading.Event()
 order_queue         = queue.Queue()
@@ -751,6 +768,7 @@ def monitor_connection():
     Bug 5 fix: reads a thread-safe Event flag instead of calling
     ib.isConnected() directly, avoiding cross-thread ib_insync access."""
     global ibkr_connected, _disconnected_at
+    last_retry = float("-inf")
     while True:
         time.sleep(10)
         if ibkr_connected and not _ibkr_connected_flag.is_set():
@@ -760,6 +778,12 @@ def monitor_connection():
             with positions_lock:
                 save_positions_state()
             reconnect_event.set()
+            last_retry = time.monotonic()
+        elif (not ibkr_connected and not reconnect_event.is_set()
+              and time.monotonic() - last_retry >= 300):
+            # Last reconnect failed (e.g. Gateway waiting for login): keep trying every 5 min.
+            reconnect_event.set()
+            last_retry = time.monotonic()
 
 # ============ BRACKET FILL MONITORING ============
 def _log_position_close(ticker, pos, exit_price, sell_qty, action='EOD_CLOSE'):
@@ -1420,6 +1444,14 @@ def place_order(ticker, alert_price, alert_time, tags='', alert_reason='',
             if recent_rs:    logger.info(f"   R/S   : {recent_rs}")
             if zero_borrow:  logger.info(f"   Borrow: 0 – {zero_borrow}")
 
+            # Tick 236 arrives even on delayed data; NaN (not reported) → let IBKR decide.
+            if is_short and not math.isnan(shortable_shares) and shortable_shares < shares:
+                logger.info(f"   🚫 Not shortable: {int(shortable_shares)} available < {shares} – skipped")
+                log_failed_trade(ticker, 'NOT_SHORTABLE', f'shortable {int(shortable_shares)} < {shares}')
+                with positions_lock:
+                    pending_tickers.discard(ticker)
+                return
+
             # ── DAY limit order ────────────────────────────────────────────
             order_action = 'SELL' if is_short else 'BUY'
             timeout_sec = SELL_LIMIT_TIMEOUT_SEC if is_short else BUY_LIMIT_TIMEOUT_SEC
@@ -1827,114 +1859,115 @@ def graceful_shutdown(signum=None, frame=None):
 signal.signal(signal.SIGINT,  graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
-# ============ DISCORD EVENTS ============
-@client.event
-async def on_ready():
-    global ibkr_thread_started
-    if ibkr_thread_started:
-        logger.info("Discord reconnected – IBKR thread already running")
+# ============ SCANNER SIGNALS ============
+def trigger_price(prev_close):
+    """Price at which a stock is up MIN_PCT_CHANGE (25%) on the day."""
+    return round(prev_close * (1 + MIN_PCT_CHANGE / 100), 4)
+
+def last_close_before(bars, today):
+    """{symbol: close of the last daily bar dated before `today` (ET, 'YYYY-MM-DD')}."""
+    out = {}
+    for sym, bs in bars.items():
+        prior = [b for b in bs if datetime.fromisoformat(b['t'].replace('Z', '+00:00'))
+                 .astimezone(ET).strftime('%Y-%m-%d') < today]
+        if prior:
+            out[sym] = prior[-1]['c']
+    return out
+
+def prev_closes(symbols, today):
+    """Yesterday's close per symbol from Alpaca SIP daily bars (free plan: end must be >15 min old)."""
+    now = datetime.now(timezone.utc)
+    params = {"symbols": ",".join(symbols), "timeframe": "1Day", "limit": 10000,
+              "start": (now - timedelta(days=10)).isoformat(),
+              "end": (now - timedelta(minutes=16)).isoformat(),
+              "feed": "sip", "adjustment": "split"}  # split-adjusted: a split today rescales yesterday
+    r = requests.get(ALPACA_BARS_URL, params=params, timeout=10, headers={
+        "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
+        "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"]})
+    r.raise_for_status()
+    return last_close_before(r.json().get("bars") or {}, today)
+
+def traded_today(day, path=TRADE_LOG_FILE):
+    """Tickers shorted (SELL entries) on `day` per the trade log: the once-per-day rule."""
+    if not os.path.exists(path):
+        return set()
+    df = pd.read_csv(path, dtype=str)
+    return set(df.loc[df['timestamp'].str.startswith(day) & (df['action'] == 'SELL'), 'ticker'])
+
+def log_signal(ticker, rank, prev_close, trigger, outcome):
+    _append_csv(SIGNAL_LOG_FILE, {
+        'timestamp': get_et().strftime('%Y-%m-%d %H:%M:%S'), 'ticker': ticker, 'rank': rank,
+        'prev_close': prev_close if prev_close is not None else '',
+        'trigger_price': trigger if trigger is not None else '', 'outcome': outcome,
+    })
+
+_scan_prev = ('', set())   # (ET day, symbols on the last good poll)
+_scan_last = float('-inf')  # monotonic time of the last poll (macOS monotonic starts near 0)
+
+def poll_scanner():
+    """Queue a short for each stock newly listed on the +25% gainers scan. IBKR thread only.
+    Outcomes after QUEUED (fill / no fill / restricted) land in the trade logs and failed_trades.csv."""
+    global _scan_prev, _scan_last
+    if (time.monotonic() - _scan_last < SCAN_POLL_SEC or not ib.isConnected()
+            or not is_rth() or is_past_eod_cutoff()):
         return
-    ibkr_thread_started = True
-
-    log_separator("=")
-    logger.info("🤖 DISCORD ALERT TRADING BOT – LIVE")
-    logger.info(f"   Account    : {client.user}")
-    logger.info(f"   Session    : {stats['session_start'].strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info(f"   Trade size : ${TRADE_AMOUNT}")
-    if TRADE_DIRECTION == 'SHORT':
-        logger.info(f"   Entry      : SHORT DAY limit (bid × {BID_LIMIT_MULTIPLIER}, fallback: alert - {IOC_LIMIT_PCT}%)")
-        logger.info(f"   Exit       : cover after {SHORT_TIME_EXIT_MIN}min, stop {SHORT_STOP_LOSS_PCT}%, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
-    else:
-        logger.info(f"   Entry      : DAY limit (ask × {ASK_LIMIT_MULTIPLIER}, fallback: alert + {IOC_LIMIT_PCT}%)")
-        logger.info(f"   Exit       : Bracket TP +{TAKE_PROFIT_PCT}% / SL -{STOP_LOSS_PCT}%, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
-    logger.info(f"   Price range: {fmt(MIN_PRICE)} – {fmt(MAX_PRICE)}")
-    logger.info(f"   Min move   : {MIN_PCT_CHANGE}%")
-    logger.info(f"   Hours      : 04:00–16:00 ET (pre-market + RTH)")
-    log_separator("=")
-
-    threading.Thread(target=connect_ibkr_thread, daemon=True).start()
-
-@client.event
-async def on_message(message):
-    if message.channel.id != CHANNEL_ID or message.author == client.user:
+    _scan_last = time.monotonic()
+    day = get_et().strftime('%Y-%m-%d')
+    try:
+        # Timeout: a lost scanner reply otherwise blocks forever (scan_logger hang, 2026-11-04).
+        rows = util.run(ib.reqScannerDataAsync(
+            SCAN_SUB, [], [TagValue('changePercAbove', str(MIN_PCT_CHANGE))]), timeout=20)
+    except Exception as e:
+        logger.warning(f"Scanner poll failed: {e!r}")
+        return
+    listed = {r.contractDetails.contract.symbol: r.rank for r in rows}
+    seen = _scan_prev[1] if _scan_prev[0] == day else set()
+    new = [s for s in listed if s not in seen]
+    _scan_prev = (day, set(listed))
+    if not new:
         return
 
-    # Assemble full text from message body and all embed fields
-    parts = [message.content]
-    for embed in message.embeds:
-        if embed.author and embed.author.name:
-            parts.append(f"Author: {embed.author.name}")
-        if embed.title:
-            parts.append(f"Title: {embed.title}")
-        if embed.description:
-            parts.append(f"Desc: {embed.description}")
-        for field in embed.fields:
-            parts.append(f"{field.name}: {field.value}")
+    done = traded_today(day)
+    todo = []
+    for sym in new:
+        with positions_lock:
+            queued = sym in pending_tickers or sym in active_positions
+        if sym in done or queued:
+            log_signal(sym, listed[sym], None, None, 'ALREADY_TRADED_TODAY' if sym in done else 'ALREADY_QUEUED')
+        else:
+            todo.append(sym)
+    if not todo:
+        return
+    # Spaced symbols ("CELG RT" rights, "BRK B") make Alpaca 400 the whole batch; they log as NO_PREV_CLOSE.
+    plain = [s for s in todo if ' ' not in s]
+    try:
+        closes = prev_closes(plain, day) if plain else {}
+    except Exception as e:
+        logger.warning(f"Alpaca prev close failed: {e!r} – retrying next poll")
+        _scan_prev[1].difference_update(todo)
+        return
 
-    alert = parse_alert("\n".join(filter(None, parts)))
-
-    with stats_lock:
-        stats['alerts_received'] += 1
-
-    if not alert:
+    for sym in todo:
+        pc = closes.get(sym)
+        trig = trigger_price(pc) if pc else None
+        if trig is None:
+            outcome = 'NO_PREV_CLOSE'
+        elif not (MIN_PRICE <= trig <= MAX_PRICE):
+            outcome = 'PRICE_FILTER'
+        else:
+            outcome = 'QUEUED'
+            with positions_lock:
+                pending_tickers.add(sym)
+            log_separator()
+            logger.info(f"🚨 SCAN: {sym} (rank {listed[sym]}) – prev close {fmt(pc)}, +{MIN_PCT_CHANGE:g}% = {fmt(trig)}")
+            order_queue.put({'ticker': sym, 'price': trig, 'timestamp': get_et(),
+                             'pct_change': f'>=+{MIN_PCT_CHANGE:g}%', 'queued_at': time.monotonic()})
+        if outcome != 'QUEUED':
+            logger.info(f"ℹ️  {sym}: scanner signal skipped – {outcome}")
+        log_signal(sym, listed[sym], pc, trig, outcome)
         with stats_lock:
-            stats['alerts_skipped'] += 1
-        return
-
-    ticker = alert['ticker']
-
-    # Ignore alerts outside regular trading hours
-    if not is_rth():
-        now_et = get_et()
-        logger.info(
-            f"⏰ {ticker}: outside market hours "
-            f"({now_et.strftime('%H:%M ET')}) – skipped"
-        )
-        log_failed_trade(
-            ticker, 'OUTSIDE_RTH',
-            f"Alert at {now_et.strftime('%H:%M:%S ET')}"
-        )
-        with stats_lock:
-            stats['alerts_skipped'] += 1
-        return
-
-    # Bug 2 fix: reject alerts that arrive after the EOD cutoff time.
-    # is_rth() passes until 16:00, but EOD close fires at 15:55 and is
-    # one-shot, so positions opened between 15:55–16:00 would be stranded.
-    if is_past_eod_cutoff():
-        now_et = get_et()
-        logger.info(
-            f"⏰ {ticker}: past EOD cutoff "
-            f"({now_et.strftime('%H:%M ET')}) – skipped"
-        )
-        log_failed_trade(
-            ticker, 'PAST_EOD_CUTOFF',
-            f"Alert at {now_et.strftime('%H:%M:%S ET')}"
-        )
-        with stats_lock:
-            stats['alerts_skipped'] += 1
-        return
-
-    # Skip if we already hold or are buying this ticker
-    with positions_lock:
-        already_active  = ticker in active_positions
-        already_pending = ticker in pending_tickers
-
-    if already_active or already_pending:
-        status = 'active' if already_active else 'queued'
-        logger.warning(f"⚠️  {ticker} already {status} – skipping")
-        log_failed_trade(ticker, 'DUPLICATE', f'Already {status}')
-        with stats_lock:
-            stats['alerts_skipped'] += 1
-        return
-
-    with positions_lock:
-        pending_tickers.add(ticker)
-
-    log_separator()
-    logger.info(f"🚨 ALERT: {ticker} @ {fmt(alert['price'])}")
-    alert['queued_at'] = time.monotonic()
-    order_queue.put(alert)
+            stats['alerts_received'] += 1
+            stats['alerts_skipped'] += outcome != 'QUEUED'
 
 # ============ IBKR THREAD ============
 def connect_ibkr_thread():
@@ -1998,6 +2031,9 @@ def connect_ibkr_thread():
             # This must happen before order processing so that a blocked
             # place_order call can never prevent EOD close from firing.
             check_eod_close()
+
+            # ── New scanner listings → order queue (throttled internally) ─────
+            poll_scanner()
 
             # ── Process one queued order ─────────────────────────────────────
             try:
@@ -2098,191 +2134,14 @@ def connect_ibkr_thread():
             logger.error(traceback.format_exc())
             time.sleep(5)  # avoid tight spin on repeated errors
 
-# ============ ALERT PARSING ============
-def parse_alert(message_content):
-    """Extract ticker, price, and metadata from a TrendVision embed.
-    Returns None for any message that should not be traded."""
-
-    # Ticker – tolerates Unicode flag emojis between the symbol and "- Alert"
-    ticker_match = re.search(r'\b([A-Z]{1,6})\b[^\n\-]*-\s*Alert', message_content)
-    if not ticker_match:
-        return None
-
-    ticker = ticker_match.group(1)
-
-    # Only trade the first alert for a ticker each day (Alert #1)
-    if not re.search(r'Alert\s*#1\b', message_content):
-        m = re.search(r'Alert\s*#(\d+)', message_content)
-        num = m.group(1) if m else '?'
-        logger.info(f"ℹ️  {ticker}: Alert #{num} – skipping (only trade #1)")
-        return None
-
-    # Price
-    price_match = re.search(
-        r'Price\s*[:\-\s]?\s*\$?([\d.]+)',
-        message_content, re.IGNORECASE | re.MULTILINE
-    )
-    if not price_match:
-        log_failed_trade(ticker, 'PARSE_ERROR', 'No price found')
-        return None
-    try:
-        price = float(price_match.group(1))
-    except ValueError:
-        log_failed_trade(ticker, 'PARSE_ERROR', 'Invalid price format')
-        return None
-
-    if not (MIN_PRICE <= price <= MAX_PRICE):
-        log_failed_trade(ticker, 'PRICE_FILTER',
-                         f'{price} outside [{MIN_PRICE}, {MAX_PRICE}]')
-        return None
-
-    # ── Optional metadata ──────────────────────────────────────────────────
-
-    # Tags: from embed.author.name ("Known Runner", "Reg SHO・Known Runner", …)
-    # Non-ASCII chars (emoji, ・) are replaced with a space to keep logs clean.
-    tags = ''
-    for prefix in ('Author:', 'Title:', 'Desc:'):
-        m = re.search(rf'^{prefix}\s*(.+)$', message_content, re.MULTILINE)
-        if m:
-            candidate = m.group(1).strip()
-            if '- Alert' not in candidate and 'Price' not in candidate:
-                tags = re.sub(r'[^\x00-\x7F]+', ' ', candidate).strip()
-                tags = re.sub(r'\s{2,}', ' ', tags)
-                break
-
-    # Alert Reason ("BREAKOUT", "MOMENTUM", "BTT V", "HUGE S", …)
-    alert_reason = ''
-    m = re.search(r'Alert\s*Reason\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        alert_reason = m.group(1).strip()
-
-    # SEC filings – anchored to "FORM"; they arrive as markdown links
-    # like "[FORM 8-K](https://www.sec.gov/...)", so keep only the form name.
-    sec_filing = ''
-    m = re.search(
-        r"Today'?s?\s*SEC\s*Fil(?:ing)?\s*[:\n]\s*((?:\[?FORM[^\n]+\n?)+)",
-        message_content, re.IGNORECASE
-    )
-    if m:
-        sec_filing = ', '.join(re.findall(r'FORM [^\]\n]+', m.group(1)))
-
-    # News headlines (bullet-separated)
-    news = ''
-    m = re.search(
-        r"Today'?s?\s*News\s*[:\n]\s*(.+?)"
-        r"(?=\n(?:Today'?s?|Alert\s*Reason|Recent|0\s*Borrow|TrendVision)|$)",
-        message_content, re.IGNORECASE | re.DOTALL
-    )
-    if m:
-        headlines = [h.strip() for h in re.split(r'\s*•\s*', m.group(1).strip()) if h.strip()]
-        news = ' | '.join(headlines)
-
-    # Recent IPO
-    recent_ipo = ''
-    m = re.search(r'Recent\s*IPO\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        recent_ipo = m.group(1).strip()
-
-    # Recent reverse split
-    recent_rs = ''
-    m = re.search(r'Recent\s*R/S\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        recent_rs = m.group(1).strip()
-
-    # Zero borrow
-    zero_borrow = ''
-    m = re.search(r'0\s*Borrow\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        zero_borrow = m.group(1).strip()
-
-    # ── Numeric scanner metrics ────────────────────────────────────────────
-    # These appear as Discord embed fields, assembled as "FieldName: Value".
-    # The regex also handles the raw "FieldName\nValue" form (description text).
-
-    # % change from the alert title line e.g. "LGHL - Alert #1 | ↑ 14.62%"
-    # Stored as a signed string: "+14.62%" or "-4.62%"
-    pct_change = ''
-    m = re.search(r'Alert\s*#\d+[^\n↑↓]*([↑↓])\s*([\d.]+)%', message_content)
-    if m:
-        sign = '+' if m.group(1) == '↑' else '-'
-        pct_change = f"{sign}{m.group(2)}%"
-    if MIN_PCT_CHANGE is not None and not (pct_change and float(pct_change.rstrip('%')) >= MIN_PCT_CHANGE):
-        logger.info(f"ℹ️  {ticker}: move {pct_change or 'N/A'} < {MIN_PCT_CHANGE:g}% – skipping")
-        return None
-
-    # Market cap e.g. "276.86K", "7.39M"
-    mcap = ''
-    m = re.search(r'MCap\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        mcap = m.group(1).strip()
-
-    # Float e.g. "210K", "12.70M", "N/A"
-    float_shares = ''
-    m = re.search(r'Float\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        float_shares = m.group(1).strip()
-
-    # Minute volume e.g. "4.41K", "26.70K"
-    min_vol = ''
-    m = re.search(r'Min\s*Vol\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        min_vol = m.group(1).strip()
-
-    # Relative volume e.g. "3.49x", "981.23x"
-    rel_vol = ''
-    m = re.search(r'Rel\s*Vol\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        rel_vol = m.group(1).strip()
-
-    # Money volume e.g. "$6.56K", "$92.54K"
-    mon_vol = ''
-    m = re.search(r'Mon\s*Vol\s*[:\n]\s*([^\n]+)', message_content, re.IGNORECASE)
-    if m:
-        mon_vol = m.group(1).strip()
-
-    logger.info(
-        f"✅ {ticker} @ {fmt(price)}"
-        + (f"  {pct_change}"          if pct_change   else '')
-        + (f"  mcap={mcap}"           if mcap         else '')
-        + (f"  float={float_shares}"  if float_shares else '')
-        + (f"  minvol={min_vol}"      if min_vol      else '')
-        + (f"  relvol={rel_vol}"      if rel_vol      else '')
-        + (f"  monvol={mon_vol}"      if mon_vol      else '')
-        + (f"  tags={tags}"           if tags         else '')
-        + (f"  reason={alert_reason}" if alert_reason else '')
-        + (f"  sec={sec_filing}"      if sec_filing   else '')
-        + (f"  ipo={recent_ipo}"      if recent_ipo   else '')
-        + (f"  rs={recent_rs}"        if recent_rs    else '')
-        + (f"  0borrow"               if zero_borrow  else '')
-    )
-
-    return {
-        'ticker'      : ticker,
-        'price'       : price,
-        'timestamp'   : get_et(),
-        'pct_change'  : pct_change,
-        'mcap'        : mcap,
-        'float_shares': float_shares,
-        'min_vol'     : min_vol,
-        'rel_vol'     : rel_vol,
-        'mon_vol'     : mon_vol,
-        'tags'        : tags,
-        'alert_reason': alert_reason,
-        'sec_filing'  : sec_filing,
-        'news'        : news,
-        'recent_ipo'  : recent_ipo,
-        'recent_rs'   : recent_rs,
-        'zero_borrow' : zero_borrow,
-    }
-
 # ============ MAIN ============
 if __name__ == "__main__":
     log_separator("=")
     logger.info("Starting bot...")
     log_separator("=")
 
-    if not DISCORD_TOKEN:
-        logger.error("❌ DISCORD_TOKEN is not set – add it to .env (see .env.example)")
+    if not (os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY")):
+        logger.error("❌ ALPACA_API_KEY / ALPACA_SECRET_KEY not set – add them to .env (needed for prev close)")
         exit(1)
 
     # Create or validate CSV files with correct headers.
@@ -2316,6 +2175,9 @@ if __name__ == "__main__":
             'slippage_pct', 'pct_change', 'mcap', 'float_shares',
             'rel_vol', 'mon_vol', 'zero_borrow',
         ]),
+        (SIGNAL_LOG_FILE, [
+            'timestamp', 'ticker', 'rank', 'prev_close', 'trigger_price', 'outcome',
+        ]),
     ]:
         if not os.path.exists(filepath):
             pd.DataFrame(columns=cols).to_csv(filepath, index=False)
@@ -2336,8 +2198,18 @@ if __name__ == "__main__":
             except Exception as e:
                 logger.warning(f"⚠️  Could not validate {filepath} header: {e}")
 
-    try:
-        client.run(DISCORD_TOKEN, bot=False)  # personal user token (discord.py 1.x)
-    except Exception as e:
-        logger.error(f"Discord error: {e}")
+    log_separator("=")
+    logger.info("🤖 IBKR SCANNER SHORT BOT – LIVE")
+    logger.info(f"   Session    : {stats['session_start'].strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"   Signal     : new on {SCAN_SUB.scanCode} ({SCAN_SUB.locationCode}) above +{MIN_PCT_CHANGE:g}%, polled every {SCAN_POLL_SEC}s")
+    logger.info(f"   Rule       : one short per stock per day")
+    logger.info(f"   Trade size : ${TRADE_AMOUNT}")
+    logger.info(f"   Entry      : SHORT DAY limit (live bid × {BID_LIMIT_MULTIPLIER}, else prev close × {1 + MIN_PCT_CHANGE/100:g} × {1 - IOC_LIMIT_PCT/100:g})")
+    logger.info(f"   Exit       : cover after {SHORT_TIME_EXIT_MIN:g}min, EOD safety net @ {EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET")
+    logger.info(f"   Hours      : 04:00–{EOD_CLOSE_HOUR:02d}:{EOD_CLOSE_MINUTE:02d} ET entries")
+    log_separator("=")
+
+    threading.Thread(target=connect_ibkr_thread, daemon=True).start()
+    while True:          # main thread stays free for the SIGTERM/SIGINT handlers
+        time.sleep(3600)
         graceful_shutdown()

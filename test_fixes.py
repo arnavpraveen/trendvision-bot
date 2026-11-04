@@ -1,4 +1,4 @@
-"""Run: python test_fixes.py  (tick rounding, commission cap, SEC filing parsing)."""
+"""Run: python test_fixes.py  (tick rounding, commission cap, SEC parsing, scanner signals)."""
 from discord_ibkr_bot import round_tick, calc_commission
 
 # Sub-$1: keep the buffer (old round(x, 2) returned 0.17, i.e. no buffer).
@@ -15,22 +15,35 @@ assert calc_commission(1000, 5.00) == 5.00  # $0.005/share
 print("ok")
 
 # SEC filings arrive as markdown links; the old regex expected lines starting with "FORM".
-from discord_ibkr_bot import parse_alert
 from export_discord_channel import parse
 alert = ("ABC :flag_us: - Alert #1 | ↑ 30.00%\nPrice\n$0.50\n"
          "Today's SEC Filing\n[FORM 8-K](https://www.sec.gov/a.htm)\n[FORM SCH 13G](https://www.sec.gov/b.xml)\n"
          "Recent IPO\nListed Today")
 assert parse(alert)["sec_filing"] == "FORM 8-K, FORM SCH 13G"
-assert parse_alert(alert)["sec_filing"] == "FORM 8-K, FORM SCH 13G"
 assert parse("ABC - Alert #1\nToday's SEC Filing\nFORM 6-K\n")["sec_filing"] == "FORM 6-K"  # plain text still works
 print("sec ok")
 
-# Only alerts already up MIN_PCT_CHANGE (25%) are traded.
-assert parse_alert("Title: ABC - Alert #1 | ↑ 25.00%\nPrice: $1.00")["pct_change"] == "+25.00%"
-assert parse_alert("Title: ABC - Alert #1 | ↑ 24.99%\nPrice: $1.00") is None
-assert parse_alert("Title: ABC - Alert #1 | ↓ 40.00%\nPrice: $1.00") is None
-assert parse_alert("Title: ABC - Alert #1\nPrice: $1.00") is None  # no move shown
-print("min move ok")
+# Scanner signals: short at the bid, but never below +25% x 0.97 of yesterday's close.
+import discord_ibkr_bot as bot
+assert bot.trigger_price(2.00) == 2.50
+assert bot.round_tick(bot.trigger_price(2.00) * (1 - bot.IOC_LIMIT_PCT / 100), up=False) == 2.42  # place_order's no-quote limit
+assert bot.round_tick(bot.trigger_price(0.40) * (1 - bot.IOC_LIMIT_PCT / 100), up=False) == 0.485
+# Yesterday's close = last Alpaca daily bar dated before today (ET); today's partial bar is ignored.
+bars = {"ABC": [{"t": "2026-11-02T05:00:00Z", "c": 1.0}, {"t": "2026-11-03T05:00:00Z", "c": 2.0},
+                {"t": "2026-11-04T05:00:00Z", "c": 3.0}],
+        "NEW": [{"t": "2026-11-04T05:00:00Z", "c": 9.0}]}  # IPO today: no prior close
+assert bot.last_close_before(bars, "2026-11-04") == {"ABC": 2.0}
+# Once per stock per day: a short (SELL) in today's trade log blocks it; covers and other days don't.
+import os, tempfile
+f = os.path.join(tempfile.mkdtemp(), "trade_log.csv")
+assert bot.traded_today("2026-11-04", f) == set()  # no log yet
+open(f, "w").write("timestamp,ticker,action,shares,price,total_value\n"
+                   "2026-11-03 10:00:00,OLD,SELL,10,1.0,10\n"
+                   "2026-11-04 09:31:02,ABC,SELL,40,2.5,100\n"
+                   "2026-11-04 10:01:05,ABC,BUY,40,2.3,92\n"
+                   "2026-11-04 10:05:00,XYZ,BUY,5,1.0,5\n")
+assert bot.traded_today("2026-11-04", f) == {"ABC"}
+print("scanner ok")
 
 # Alpaca fetch groups alerts by US/Eastern date: 00:30 UTC belongs to the previous ET day.
 from fetch_alpaca_bars import ticker_days
@@ -54,3 +67,24 @@ assert np.isnan(forward(t, o, h, l, c, 100, end_min=120, close_min=1000)["r30"])
 assert forward(t, o, h, l, c, alert_min=300, end_min=1000, close_min=1000) is None  # no bar after alert
 assert num("$137.50K") == 137500 and num("4.3M") == 4.3e6 and num("-15.88%") == -15.88 and np.isnan(num("N/A"))
 print("event study ok")
+
+# After a failed reconnect, the monitor keeps asking for retries (it used to give up).
+import time as _time
+import discord_ibkr_bot as bot
+_real_sleep, _ticks = _time.sleep, [0]
+def _fake_sleep(s):
+    _ticks[0] += 1
+    if _ticks[0] > 1:
+        raise StopIteration
+_time.sleep = _fake_sleep
+bot.ibkr_connected = False
+bot._ibkr_connected_flag.clear()
+bot.reconnect_event.clear()
+try:
+    bot.monitor_connection()
+except StopIteration:
+    pass
+finally:
+    _time.sleep = _real_sleep
+assert bot.reconnect_event.is_set()
+print("reconnect retry ok")
