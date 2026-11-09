@@ -1981,8 +1981,8 @@ def connect_ibkr_thread():
     log_separator("=")
 
     if not connect_with_retry(max_retries=3):
-        logger.error("❌ Could not connect to Gateway – exiting IBKR thread")
-        return
+        logger.error("❌ Could not connect to Gateway – exiting (launchd restarts the bot)")
+        os._exit(1)  # a live process with a dead IBKR thread would never trade
 
     threading.Thread(target=monitor_connection, daemon=True).start()
     logger.info("Connection monitor started")
